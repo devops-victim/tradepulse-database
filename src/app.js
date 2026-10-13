@@ -8,7 +8,7 @@ module.exports = function createApp(db, extractions) {
         res.vary('Origin');
         if (origin && (config.corsOrigins.includes(origin) || config.corsOrigins.includes('*'))) {
             res.set('Access-Control-Allow-Origin', config.corsOrigins.includes('*') ? '*' : origin);
-            res.vary('Origin'); res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS'); res.set('Access-Control-Allow-Headers', 'Content-Type');
+            res.vary('Origin'); res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS'); res.set('Access-Control-Allow-Headers', 'Content-Type,Idempotency-Key');
         }
         if (req.method === 'OPTIONS') return res.sendStatus(204);
         next();

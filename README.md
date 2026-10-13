@@ -105,7 +105,7 @@ The server supports 15-minute synchronous delays, but client/proxy timeouts may 
 
 ### Asynchronous extraction workflow
 
-POST accepts JSON containing optional `symbol`, `from`, `to`, and `delay`. Pagination parameters are not accepted. Processing delay is configurable up to 900000 ms subject to `MAX_DELAY_MS`.
+POST accepts JSON containing optional `symbol`, `from`, `to`, and `delay`, plus the paired callback registration fields described below. Pagination parameters are not accepted. Processing delay is configurable up to 900000 ms subject to `MAX_DELAY_MS`.
 
 ```sh
 curl -i -X POST 'http://localhost:4001/extractions' \
@@ -141,24 +141,105 @@ Copied results observe one consistent PostgreSQL statement snapshot. Subsequent 
 
 **Events and recovery:** a committed job emits an in-process event that arms an independent non-blocking one-shot timer. At startup the worker obtains a session advisory lock and performs one recovery scan for pending/processing jobs. It restores timers using persisted `ready_at`; overdue jobs complete immediately. There is no periodic scan, status polling loop, cron or scheduler. Graceful shutdown cancels timers and retains durable jobs. Worker connection loss stops the service so a process manager can restart it. If a database outage prevents persisting a failure, startup recovery retries that durable job.
 
-Run **one service replica per database schema**; a second worker is rejected by the lock. Jobs inserted directly by SQL after startup do not emit service events. Metadata/snapshots are retained until an administrator explicitly deletes them; there is no automatic cleanup scheduler. Repeating a POST creates a separate job. This demonstration service has no authentication; use your deployment's access control if needed.
+Run **one service replica per database schema**; a second worker is rejected by the lock. Jobs inserted directly by SQL after startup do not emit service events. Metadata/snapshots are retained until an administrator explicitly deletes them; there is no automatic cleanup scheduler. Repeating a POST without an idempotency key creates a separate job. Trade endpoints and extraction submission have no authentication; use your deployment's access control if needed. Notification administration requires the webhook bearer secret.
+
+### TradePulse completion callbacks
+
+Existing calls without registration continue to work. To register a completion notification, provide **both** `callbackUrl` and `clientJobId` (TradePulse's UUID). These are registration metadata, never trade filters. The 202 receipt, extraction status and cursor result response shapes are unchanged, including early 409 `EXTRACTION_NOT_READY`.
+
+Configure BSE's ignored `.env` before starting:
+
+```env
+BSE_WEBHOOK_SECRET=<random shared secret of at least 32 characters>
+BSE_CALLBACK_ALLOWLIST=http://localhost:4000/api/bse/notifications
+BSE_WEBHOOK_TIMEOUT_MS=10000
+BSE_WEBHOOK_MAX_ATTEMPTS=6
+BSE_WEBHOOK_RETRY_BASE_MS=1000
+BSE_WEBHOOK_RETRY_MAX_MS=300000
+```
+
+Generate a secret locally with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` and configure the same value independently on TradePulse. Keep it out of version control, registration bodies, URLs and logs. Empty BSE secret disables callback registration (503 `WEBHOOK_NOT_CONFIGURED`) while preserving non-callback extractions. Configured secrets require 32–512 printable non-space ASCII characters.
+
+```sh
+curl -i -X POST 'http://localhost:4001/extractions' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: tradepulse-request-unique-key' \
+  -d '{"delay":900000,"symbol":"TCS","clientJobId":"c6f6d735-52be-4e67-ae19-c5b7d968c2f0","callbackUrl":"http://localhost:4000/api/bse/notifications"}'
+```
+
+After the extraction's terminal transaction commits, BSE sends a POST with `Authorization: Bearer <BSE_WEBHOOK_SECRET>` and `Content-Type: application/json` to the stored approved URL:
+
+```json
+{
+  "externalJobId": "26cdac89-4afb-4b26-a433-d69a4c870adb",
+  "clientJobId": "c6f6d735-52be-4e67-ae19-c5b7d968c2f0",
+  "status": "completed"
+}
+```
+
+Failed extractions send the same identifiers with `status: "failed"`. No trades or secrets appear in notification bodies. Any 2xx acknowledges delivery; TradePulse normally returns 202 after durable acceptance and then ingests cursor results in the background. BSE stops waiting at acknowledgement headers and never waits for ingestion or dashboard updates. Callbacks may arrive before a caller observes its extraction receipt, so TradePulse must correlate on its own `clientJobId` as well as `externalJobId`.
+
+`BSE_CALLBACK_ALLOWLIST` lists exact callback origin/path combinations, including scheme, host and port. No wildcard matching, credentials, fragments or query strings are allowed. Stored destinations are checked again on every dispatch. Development defaults explicitly to the local TradePulse URL; production defaults to no allowed destination and requires HTTPS. Configure only the approved TradePulse recipient because all allowlisted destinations use the same secret. Protect the allowlist, DNS and outbound network policy in cloud hosting; localhost works only in the same machine/network namespace.
+
+### Durable outbox and retry recovery
+
+Migration `002_callbacks_and_idempotency.sql` adds nullable registration/idempotency fields and `extraction_outbox`; it does not alter or reseed source trades. Deploy with `npm run migrate`, then restart BSE. Existing jobs without registration do not acquire callbacks retroactively.
+
+Terminal extraction status and its unique `(job_id, terminal_status)` event are committed in one transaction. An event wakes the outbox only after commit. Delivery failure changes only outbox state, never completed extraction status or results. Atomic claims and the worker's schema session lock prevent competing workers from taking the same transition. There is a possible repeated delivery if BSE exits after TradePulse accepts but before recording acknowledgement; delivery is **at least once**, and TradePulse must deduplicate identical job/status correlations.
+
+Outbox states are `pending`, `delivering`, `retry`, `delivered`, `permanent_failure`, and `exhausted`. Attempts, per-redelivery-cycle attempts, next attempt time, HTTP status and bounded generic diagnostic codes are durable. Receiver response bodies and raw network error strings are not stored or logged.
+
+Each known notification uses its own one-shot timer. Network failures, disconnects, HTTP timeouts, 429 and 5xx retry with bounded exponential backoff. `Retry-After` seconds or dates can increase the delay up to the configured cap. Defaults are a 10-second whole-HTTP-exchange deadline (configurable 100–25000 ms), six attempts (1–20), a 1-second base and a 5-minute cap (up to 15 minutes). Response headers/body are bounded at 16 KB; redirects are never followed. Other non-2xx responses are permanent failures. A retry cycle stops at its configured attempt limit and remains inspectable.
+
+At startup the service scans unfinished outbox rows once, recovers interrupted claims, and arms persisted next-attempt timers alongside the extraction recovery scan. Recovered delivery is deferred until the source HTTP listener is ready so TradePulse can fetch results immediately. Shutdown aborts active HTTP sends and preserves state. An interrupted attempt counts toward the retry limit. Database failure that prevents recording delivery state stops the worker for process-manager restart. There are no recurring queue scans, extraction-status polling loops, setInterval timers, cron jobs or frontend polling in BSE.
+
+### Notification status and explicit redelivery
+
+Both administration endpoints require the same bearer secret. Supply authentication securely rather than placing the secret in URLs or committing it in a command file.
+
+| Method | Endpoint | Function |
+| --- | --- | --- |
+| GET | `/extractions/:jobId/notification` | Delivery state, attempts, next attempt and diagnostic metadata |
+| POST | `/extractions/:jobId/notification/redeliver` | 202: start a fresh retry cycle for a delivered, permanent or exhausted notification |
+
+Redelivery retains identifiers and lifetime attempt count, resets cycle attempts, and revalidates the destination. Its empty body cannot change a destination or secret. Already pending/active delivery returns 409 `NOTIFICATION_ACTIVE`; absence of a terminal registered event returns 404 `NOTIFICATION_NOT_FOUND`. Delivered notifications can be deliberately redelivered, so duplicate handling is testable. Authentication failure returns 401. Failed/exhausted rows are never silently removed.
+
+### Submission idempotency
+
+`POST /extractions` durably supports `Idempotency-Key` (1–200 letters, digits, dots, underscores, colons or hyphens). Concurrent equivalent requests share one extraction and snapshot, returning the original short 202 job receipt. Reuse with different effective filters, delay or callback metadata returns 409 `IDEMPOTENCY_CONFLICT`. Timestamp offsets/fractional formatting, UUID case and normalized equivalent callback URLs do not create false conflicts. Defaults are resolved before comparison; changed server defaults can conflict with a retry that omitted those values, so clients should submit explicit delay when required. Keys persist for the retained job's lifetime. No key preserves the previous create-a-new-job behavior.
+
+### TradePulse configuration and deployment
+
+After BSE's migration and idempotency verification, configure TradePulse independently:
+
+```env
+BSE_COMPLETION_MODE=webhook
+BSE_CALLBACK_URL=http://localhost:4000/api/bse/notifications
+BSE_WEBHOOK_SECRET=<same random secret configured on BSE>
+BSE_SUPPORTS_IDEMPOTENCY=true
+```
+
+In cloud hosting, both the TradePulse URL and BSE allowlist must use the publicly reachable HTTPS backend callback. Restart both services after configuration/migrations. Start a pull from TradePulse and confirm ingestion and its event-driven dashboard update without `/refresh` or reloading. This repository does not modify TradePulse code, configuration or database; tests exercise a separate durable HTTP receiver fixture. Production end-to-end verification requires a running correctly configured TradePulse receiver and its dashboard.
 
 ### Error responses
 
 Errors use `{"success":false,"error":{"code":"INVALID_PARAMETER","message":"limit must be an integer between 1 and 1000"}}`.
 
-HTTP codes: 400 invalid input/JSON, 404 missing resource/route, 409 extraction not ready/failed, 413 JSON body over 16 KB, 503 database/worker unavailable. Internal database details and connection credentials are never returned. SQL values are parameterized.
+HTTP codes: 400 invalid input/JSON, 401 invalid notification-admin authentication, 404 missing resource/route, 409 extraction not ready/failed or conflicting idempotency/redelivery, 413 JSON body over 16 KB, 503 database/worker unavailable or callbacks unconfigured. Internal database details and connection credentials are never returned. SQL values are parameterized.
 
 ## Tests
 
 ```sh
 npm test
 npm run test:integration
+npm run test:webhooks
 ```
 
 Validation and HTTP error tests run without PostgreSQL. Integration tests require `TEST_DATABASE_URL` or `DATABASE_URL`; otherwise the PostgreSQL test is explicitly skipped. Tests create a unique temporary schema, migrate/seed it and drop only that schema. The account needs CREATE schema privileges. Tests never truncate your application trades; schema-scoped worker locks allow a live service to coexist with the test schema.
 
 Coverage: exactly 10,000 seed records and idempotency; migration reruns; constraints; full pagination and microsecond ties; symbol/date filters; delays and responsiveness; prompt 202 acknowledgement; consistent paginated extraction snapshots; pending/processing restart recovery; worker exclusivity; persisted processing failure; malformed inputs and unavailable database responses. Logs for intentionally injected failures are expected.
+
+Webhook fixtures additionally exercise real authenticated HTTP, completed/failed callbacks, duplicate correlation and durable receiver deduplication, early callback before receipt, timeout/retry/downtime, worker and actual source-process restart with pending delivery, interrupted delivery recovery, forbidden stored URLs, transaction rollback on outbox insertion failure, racing terminal events, permanent/exhausted failure and redelivery, equivalent/conflicting concurrent idempotency, and a real **31-second extraction**. The test waits on the callback event, not an extraction-status polling loop. It does not claim a 15-minute run. Isolated fixture source fingerprints must remain identical.
 
 ## Cloud deployment
 

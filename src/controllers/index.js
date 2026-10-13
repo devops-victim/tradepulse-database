@@ -3,6 +3,7 @@ const v = require('../validation');
 const config = require('../config');
 const trades = require('../services/trades');
 const { ApiError } = require('../errors');
+const callback = require('../webhook-validation');
 module.exports = function controllers(db, extractions) {
  return {
   health: async (req, res) => {
@@ -31,11 +32,20 @@ module.exports = function controllers(db, extractions) {
    res.json({ success: true, data: rows[0] });
   },
   createExtraction: async (req, res) => {
-   v.allowed(req.query, []); v.allowed(req.body ?? {}, ['symbol','from','to','delay']);
-   const body = req.body ?? {}, result = await extractions.create(v.filters(body), v.delay(body.delay, config.extractionDelay));
+   v.allowed(req.query, []); v.allowed(req.body ?? {}, ['symbol','from','to','delay','callbackUrl','clientJobId']);
+   const body = req.body ?? {}, registration = callback.registration(body, extractions.webhookOptions);
+   const result = await extractions.create(v.filters(body), v.delay(body.delay, config.extractionDelay), registration, callback.idempotencyKey(req.get('Idempotency-Key')));
    res.location(result.statusUrl).status(202).json({ success: true, ...result });
   },
   extraction: async (req, res) => { v.allowed(req.query, []); res.json({ success: true, data: await extractions.get(v.uuid(req.params.jobId)) }); },
+  notification: async (req, res) => {
+   callback.authorize(req.get('Authorization'), extractions.webhookOptions); v.allowed(req.query, []);
+   res.json({ success: true, data: await extractions.outbox.get(v.uuid(req.params.jobId)) });
+  },
+  redeliver: async (req, res) => {
+   callback.authorize(req.get('Authorization'), extractions.webhookOptions); v.allowed(req.query, []); v.allowed(req.body ?? {}, []);
+   res.status(202).json({ success: true, ...await extractions.outbox.redeliver(v.uuid(req.params.jobId)) });
+  },
   extractionResults: async (req, res) => {
    v.allowed(req.query, ['limit','cursor']);
    const id = v.uuid(req.params.jobId), page = v.page(req.query, id), job = await extractions.get(id);

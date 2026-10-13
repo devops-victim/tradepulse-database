@@ -16,8 +16,12 @@ process.on('SIGTERM', () => shutdown().catch(() => process.exit(1)));
 (async () => {
     if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required; configure .env');
     await pool.query('SELECT trade_id FROM trades LIMIT 1');
-    await worker.start();
-    server = createApp(pool, worker).listen(config.port, () => console.log(`BSE Trade API listening on port ${config.port}`));
+    await worker.start({ deferDelivery: true });
+    server = createApp(pool, worker).listen(config.port, () => {
+        // Recovered notifications must not reach TradePulse before results HTTP is ready.
+        worker.outbox.resume();
+        console.log(`BSE Trade API listening on port ${config.port}`);
+    });
     // Synchronous delay endpoint supports 15 minutes; async results never delay.
     server.timeout = config.maxDelay + 30000;
     server.requestTimeout = 30000;

@@ -101,10 +101,13 @@ test('PostgreSQL API integration and durable extraction recovery', {skip: !proce
    const other = new Worker(db); await assert.rejects(other.start(), /Another extraction worker/);
    await worker.stop();
    let injectFailure = true;
-   const faultyDb = { connect: () => db.connect(), query: (sql, values) => {
-    if (injectFailure && sql.startsWith("UPDATE extraction_jobs SET status='completed'")) { injectFailure=false; return Promise.reject(new Error('simulated processing failure')); }
-    return db.query(sql, values);
-   } };
+   const faultyDb = { connect: async () => {
+    const client = await db.connect();
+    return { on: (...args) => client.on(...args), release: () => client.release(), query: (sql, values) => {
+     if (injectFailure && sql.startsWith('UPDATE extraction_jobs SET status=$2') && values[1] === 'completed') { injectFailure=false; return Promise.reject(new Error('simulated processing failure')); }
+     return client.query(sql, values);
+    } };
+   }, query: (sql, values) => db.query(sql, values) };
    worker=new Worker(faultyDb); await worker.start();
    const created=await worker.create({},0); await sleep(100);
    assert.equal((await worker.get(created.jobId)).status,'failed');

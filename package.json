@@ -21,7 +21,8 @@
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
     "test": "node --test tests/*.test.js",
-    "test:integration": "node --test tests/integration.test.js"
+    "test:integration": "node --test tests/integration.test.js",
+    "test:webhooks": "node --test tests/webhook-validation.test.js tests/webhooks.test.js"
   },
   "dependencies": {
     "dotenv": "^18.0.7",
