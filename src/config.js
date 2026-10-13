@@ -37,7 +37,7 @@ module.exports = {
                 ca: fs.readFileSync(process.env.PG_SSL_CA_FILE, 'utf8'),
                 rejectUnauthorized: true
             }
-            : process.env.PG_SSL === 'false'
+            : process.env.PG_SSL === 'true'
                 ? { rejectUnauthorized: true }
                 : undefined
     }
