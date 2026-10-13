@@ -32,6 +32,13 @@ module.exports = {
         max: integer('PG_POOL_MAX', 10, 2, 100),
         connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, statement_timeout: 20000,
         options: '-c timezone=UTC',
-        ...(process.env.PG_SSL_CA_FILE ? { ssl: { ca: fs.readFileSync(process.env.PG_SSL_CA_FILE, 'utf8'), rejectUnauthorized: true } } : {})
+        ssl: process.env.PG_SSL_CA_FILE
+            ? {
+                ca: fs.readFileSync(process.env.PG_SSL_CA_FILE, 'utf8'),
+                rejectUnauthorized: true
+            }
+            : process.env.PG_SSL === 'true'
+                ? { rejectUnauthorized: true }
+                : undefined
     }
 };
